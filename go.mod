@@ -1,4 +1,4 @@
-module github.com/devploit/400OK
+module github.com/0xbugatti/400OK
 
 go 1.23.0
 
