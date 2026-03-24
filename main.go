@@ -16,7 +16,7 @@ limitations under the License.
 
 package main
 
-import "github.com/devploit/400OK/cmd"
+import "github.com/0xbugatti/400OK/cmd"
 
 func main() {
 	cmd.Execute()
