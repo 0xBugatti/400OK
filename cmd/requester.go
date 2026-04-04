@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,8 +22,13 @@ import (
 	"time"
 	"unicode"
 
+	"crypto/tls"
+
 	"github.com/fatih/color"
+	"github.com/schollz/progressbar/v3"
 	"github.com/zenthangplus/goccm"
+	"golang.org/x/net/http2"
+	"golang.org/x/term"
 )
 
 type Result struct {
@@ -48,10 +54,14 @@ type RequestOptions struct {
 	reqHeaders    []string
 	banner        bool
 	autocalibrate bool
+	defaultCL     int
+	calTolerance  int
+	jsonBody      string
 }
 
 var _verbose bool
 var defaultCl int
+var calTolerance int
 var uniqueResults = make(map[string]bool)
 var uniqueResultsByTechnique = make(map[string]map[string]bool)
 var verbTamperingResults = make(map[string]int)
@@ -78,15 +88,26 @@ var (
 	shownResultsMutex        = &sync.Mutex{}
 )
 
+// Smart filter state (@defparam)
+type smartFilterEntry struct {
+	count int
+	muted bool
+}
+
+var (
+	smartFilter   = make(map[string]*smartFilterEntry)
+	smartFilterMu sync.Mutex
+)
+
 // JSONResult represents a single result for JSON output
 type JSONResult struct {
-	Timestamp     string `json:"timestamp"`
-	Status        int    `json:"status"`
-	Size          int    `json:"size"`
-	Result        string `json:"result"`
-	Payload       string `json:"payload"`
-	Technique     string `json:"technique"`
-	IsPotentialBypass bool `json:"is_potential_bypass"`
+	Timestamp         string `json:"timestamp"`
+	Status            int    `json:"status"`
+	Size              int    `json:"size"`
+	Result            string `json:"result"`
+	Payload           string `json:"payload"`
+	Technique         string `json:"technique"`
+	IsPotentialBypass bool   `json:"is_potential_bypass"`
 }
 
 // JSONOutput represents the complete JSON output structure
@@ -96,13 +117,13 @@ type JSONOutput struct {
 	EndTime   string       `json:"end_time"`
 	Results   []JSONResult `json:"results"`
 	Summary   struct {
-		Total      int64   `json:"total_requests"`
-		Success    int64   `json:"successful_2xx"`
-		Redirects  int64   `json:"redirects_3xx"`
-		Errors     int64   `json:"errors_5xx"`
-		Duration   string  `json:"duration"`
-		SuccessRate float64 `json:"success_rate"`
-		Bypasses   []string `json:"potential_bypasses"`
+		Total       int64    `json:"total_requests"`
+		Success     int64    `json:"successful_2xx"`
+		Redirects   int64    `json:"redirects_3xx"`
+		Errors      int64    `json:"errors_5xx"`
+		Duration    string   `json:"duration"`
+		SuccessRate float64  `json:"success_rate"`
+		Bypasses    []string `json:"potential_bypasses"`
 	} `json:"summary"`
 }
 
@@ -118,7 +139,7 @@ type WaybackResponse struct {
 }
 
 // printResponse prints the results of HTTP requests in a tabular format with colored output based on the status codes.
-func printResponse(result Result, technique string) {
+func printResponse(result Result, technique string, options RequestOptions) {
 	printMutex.Lock()
 	defer printMutex.Unlock()
 
@@ -137,7 +158,7 @@ func printResponse(result Result, technique string) {
 	key := fmt.Sprintf("%d-%d", result.statusCode, result.contentLength)
 
 	// Check if this is a potential bypass (2xx response)
-	isPotentialBypass := result.statusCode >= 200 && result.statusCode < 300 && result.contentLength != defaultCl
+	isPotentialBypass := result.statusCode >= 200 && result.statusCode < 300 && result.contentLength != options.defaultCL
 
 	// Add to JSON results if JSON output is enabled
 	if len(jsonOutput) > 0 {
@@ -163,7 +184,7 @@ func printResponse(result Result, technique string) {
 
 	// If verbose mode is enabled, directly print the result
 	if _verbose || technique == "http-versions" {
-		printResult(result)
+		printResult(result, options)
 		return
 	}
 
@@ -217,13 +238,12 @@ func printResponse(result Result, technique string) {
 	uniqueResultsByTechMutex.Unlock()
 
 	// Print the result after all filters are applied
-	printResult(result)
+	printResult(result, options)
 }
 
 // printResult prints the result of an HTTP request in a tabular format with colored output based on the status codes.
-func printResult(result Result) {
+func printResult(result Result, options RequestOptions) {
 	// Format the result
-	resultContentLength := strconv.Itoa(result.contentLength) + " bytes"
 	var code string
 
 	// Assign colors to HTTP status codes based on their range
@@ -239,11 +259,32 @@ func printResult(result Result) {
 	case 500, 501, 502, 503, 504, 505, 511:
 		code = color.MagentaString(strconv.Itoa(result.statusCode))
 	default:
-		code = strconv.Itoa(result.statusCode) // No color for other codes
+		code = strconv.Itoa(result.statusCode)
+	}
+
+	// Color-coded content-length relative to baseline (from nomore403)
+	clStr := strconv.Itoa(result.contentLength) + " bytes"
+	var clColor string
+	if options.defaultCL > 0 {
+		ratio := float64(result.contentLength) / float64(options.defaultCL)
+		switch {
+		case result.contentLength > options.defaultCL*2:
+			clColor = color.GreenString(clStr)
+		case ratio > 1.2:
+			clColor = color.CyanString(clStr)
+		case ratio >= 0.8 && ratio <= 1.2:
+			clColor = color.BlueString(clStr)
+		case ratio < 0.5:
+			clColor = color.RedString(clStr)
+		default:
+			clColor = color.YellowString(clStr)
+		}
+	} else {
+		clColor = color.BlueString(clStr)
 	}
 
 	// Print the result
-	fmt.Printf("%s \t%20s %s\n", code, color.BlueString(resultContentLength), result.line)
+	fmt.Printf("%s \t%20s %s\n", code, clColor, result.line)
 }
 
 // showInfo prints the configuration options used for the scan.
@@ -332,24 +373,33 @@ func selectRandomCombinations(combinations []string, n int) []string {
 	return combinations[:n]
 }
 
+// isInterestingResponse checks if a response differs significantly from the baseline
+func isInterestingResponse(statusCode, contentLength int, options RequestOptions) bool {
+	if options.verbose {
+		return true
+	}
+	if statusCode >= 400 {
+		return false
+	}
+	if options.defaultCL == 0 {
+		return true
+	}
+	return contentLength != options.defaultCL
+}
+
 // requestDefault makes HTTP request to check the default response
 func requestDefault(options RequestOptions) {
 	color.Cyan("\n━━━━━━━━━━━━━━━ DEFAULT REQUEST ━━━━━━━━━━━━━━")
-
-	var results []Result
 
 	statusCode, response, err := request(options.method, options.uri, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
 	if err != nil {
 		log.Println(err)
 	}
 
-	results = append(results, Result{options.method, statusCode, len(response), true})
-	printResponse(Result{uri, statusCode, len(response), true}, "default")
+	printResponse(Result{line: options.uri, statusCode: statusCode, contentLength: len(response), defaultReq: true}, "default", options)
 
 	uniqueResultsMutex.Lock()
-	for _, result := range results {
-		defaultCl = result.contentLength
-	}
+	defaultCl = len(response)
 	uniqueResultsMutex.Unlock()
 }
 
@@ -374,6 +424,7 @@ func requestMethods(options RequestOptions) {
 			statusCode, response, err := request(line, options.uri, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
 			if err != nil {
 				log.Println(err)
+				return
 			}
 
 			contentLength := len(response)
@@ -392,7 +443,7 @@ func requestMethods(options RequestOptions) {
 				contentLength: len(response),
 				defaultReq:    false,
 			}
-			printResponse(result, "verb-tampering")
+			printResponse(result, "verb-tampering", options)
 		}(line)
 	}
 	w.WaitAllDone()
@@ -428,6 +479,7 @@ func requestMethodsCaseSwitching(options RequestOptions) {
 				statusCode, response, err := request(method, options.uri, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
 				if err != nil {
 					log.Println(err)
+					return
 				}
 
 				contentLength := len(response)
@@ -443,7 +495,7 @@ func requestMethodsCaseSwitching(options RequestOptions) {
 					defaultReq:    false,
 				}
 
-				printResponse(result, "verb-tampering-case")
+				printResponse(result, "verb-tampering-case", options)
 			}(method)
 		}
 	}
@@ -514,7 +566,9 @@ func requestHeaders(options RequestOptions) {
 			defer w.Done()
 
 			// Add headers to the request
-			headers := append(options.headers, header{item.Line, item.IP})
+			headers := make([]header, len(options.headers)+1)
+			copy(headers, options.headers)
+			headers[len(options.headers)] = header{item.Line, item.IP}
 
 			statusCode, response, err := request(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
 			if err != nil {
@@ -528,7 +582,7 @@ func requestHeaders(options RequestOptions) {
 				contentLength: len(response),
 				defaultReq:    false,
 			}
-			printResponse(result, "headers")
+			printResponse(result, "headers", options)
 		}(item)
 	}
 
@@ -544,7 +598,9 @@ func requestHeaders(options RequestOptions) {
 				log.Printf("Invalid simple header format: %s\n", line)
 				return
 			}
-			headers := append(options.headers, header{parts[0], parts[1]})
+			headers := make([]header, len(options.headers)+1)
+			copy(headers, options.headers)
+			headers[len(options.headers)] = header{parts[0], parts[1]}
 
 			statusCode, response, err := request(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
 			if err != nil {
@@ -558,7 +614,7 @@ func requestHeaders(options RequestOptions) {
 				contentLength: len(response),
 				defaultReq:    false,
 			}
-			printResponse(result, "headers")
+			printResponse(result, "headers", options)
 		}(simpleHeader)
 	}
 	w.WaitAllDone()
@@ -598,6 +654,7 @@ func requestEndPaths(options RequestOptions) {
 			statusCode, response, err := request(options.method, joinURL(options.uri, line), options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
 			if err != nil {
 				log.Println(err)
+				return
 			}
 
 			contentLength := len(response)
@@ -613,7 +670,7 @@ func requestEndPaths(options RequestOptions) {
 				defaultReq:    false,
 			}
 
-			printResponse(result, "endpaths")
+			printResponse(result, "endpaths", options)
 		}(line)
 	}
 
@@ -633,8 +690,12 @@ func requestMidPaths(options RequestOptions) {
 	parsedURL, err := url.Parse(options.uri)
 	if err != nil {
 		log.Println(err)
+		return
 	}
 	if parsedURL.Path != "" && parsedURL.Path != "/" {
+		if len(x) < 2 {
+			return
+		}
 		if options.uri[len(options.uri)-1:] == "/" {
 			uripath = x[len(x)-2]
 		} else {
@@ -642,6 +703,9 @@ func requestMidPaths(options RequestOptions) {
 		}
 
 		baseuri := strings.ReplaceAll(options.uri, uripath, "")
+		if len(baseuri) < 2 {
+			return
+		}
 		baseuri = baseuri[:len(baseuri)-1]
 
 		w := goccm.New(maxGoroutines)
@@ -662,6 +726,7 @@ func requestMidPaths(options RequestOptions) {
 				statusCode, response, err := request(options.method, fullpath, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
 				if err != nil {
 					log.Println(err)
+					return
 				}
 
 				contentLength := len(response)
@@ -676,10 +741,165 @@ func requestMidPaths(options RequestOptions) {
 					contentLength: len(response),
 					defaultReq:    false,
 				}
-				printResponse(result, "midpaths")
+				printResponse(result, "midpaths", options)
 			}(line)
 		}
 		w.WaitAllDone()
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// TTY PROGRESS BAR HELPER (from nomore403)
+// ─────────────────────────────────────────────────────────────
+
+func isTTY() bool {
+	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+func newProgress(desc string, total int) *progressbar.ProgressBar {
+	if !isTTY() {
+		return nil
+	}
+	return progressbar.NewOptions(total,
+		progressbar.OptionSetDescription(desc),
+		progressbar.OptionSetWidth(35),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetPredictTime(false),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+}
+
+// ─────────────────────────────────────────────────────────────
+// NEW TECHNIQUE: JSON Body Tampering (from Forbidden-Buster)
+// ─────────────────────────────────────────────────────────────
+
+func requestJSONTamper(options RequestOptions) {
+	if options.jsonBody == "" {
+		return
+	}
+
+	var jsonData map[string]interface{}
+	if err := json.Unmarshal([]byte(options.jsonBody), &jsonData); err != nil {
+		color.Red("[!] Invalid JSON body: %v", err)
+		return
+	}
+
+	color.Cyan("\n━━━━━━━━━━━━━━━ JSON BODY TAMPERING ━━━━━━━━━━━━━━━")
+	fmt.Printf("  Testing mass assignment via nested object + array wrapping...\n")
+
+	// Transform 1: {"id":111} → {"id":{"id":111}}
+	nestedObj := make(map[string]interface{})
+	for k, v := range jsonData {
+		nestedObj[k] = map[string]interface{}{k: v}
+	}
+	nestedJSON, _ := json.Marshal(nestedObj)
+
+	// Transform 2: {"id":111} → {"id":[111]}
+	arrayObj := make(map[string]interface{})
+	for k, v := range jsonData {
+		arrayObj[k] = []interface{}{v}
+	}
+	arrayJSON, _ := json.Marshal(arrayObj)
+
+	tamperTests := []struct {
+		name string
+		body []byte
+	}{
+		{"nested_object", nestedJSON},
+		{"array_wrapping", arrayJSON},
+	}
+
+	w := goccm.New(maxGoroutines)
+	for _, test := range tamperTests {
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+		w.Wait()
+		go func(n string, b []byte) {
+			defer w.Done()
+			headers := append([]header{}, options.headers...)
+			headers = append(headers, header{"Content-Type", "application/json"})
+			statusCode, body, err := requestWithBody("POST", options.uri, headers, b, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			if err != nil {
+				return
+			}
+			cl := len(body)
+			if isInterestingResponse(statusCode, cl, options) {
+				if checkSmartFilter(statusCode, cl) {
+					printResponse(Result{
+						line:          fmt.Sprintf("JSON-Tamper(%s): %s", n, string(b)),
+						statusCode:    statusCode,
+						contentLength: cl,
+					}, "json-tamper", options)
+				}
+			}
+		}(test.name, test.body)
+	}
+	w.WaitAllDone()
+}
+
+// ─────────────────────────────────────────────────────────────
+// ENHANCED HTTP/2 PURE GO (from Forbidden-Buster)
+// ─────────────────────────────────────────────────────────────
+
+func requestHttpVersionsPureGo(options RequestOptions) {
+	parsedURL, _ := url.Parse(options.uri)
+	if !strings.HasPrefix(options.uri, "https://") {
+		return
+	}
+
+	color.Cyan("\n━━━━━━━━━━━━━━━ HTTP/2 PURE GO ━━━━━━━━━━━━━━━")
+
+	transport := &http2.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   time.Duration(options.timeout) * time.Millisecond,
+	}
+
+	if !options.redirect {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+
+	req, err := http.NewRequest(options.method, options.uri, nil)
+	if err != nil {
+		return
+	}
+	req.Host = parsedURL.Host
+	for _, h := range options.headers {
+		req.Header.Set(h.key, h.value)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	cl := len(body)
+
+	// Rate limit check
+	if options.rateLimit && resp.StatusCode == 429 {
+		log.Fatalf("Rate limit detected (HTTP 429). Exiting...")
+	}
+
+	if isInterestingResponse(resp.StatusCode, cl, options) {
+		if checkSmartFilter(resp.StatusCode, cl) {
+			printResponse(Result{
+				line:          "HTTP/2 (pure Go)",
+				statusCode:    resp.StatusCode,
+				contentLength: cl,
+			}, "http-versions", options)
+		}
 	}
 }
 
@@ -735,7 +955,7 @@ func requestDoubleEncoding(options RequestOptions) {
 				contentLength: len(response),
 				defaultReq:    false,
 			}
-			printResponse(result, "double-encoding")
+			printResponse(result, "double-encoding", options)
 		}(encodedUri, c)
 	}
 
@@ -749,13 +969,13 @@ func requestHttpVersions(options RequestOptions) {
 	httpVersions := []string{"--http1.0"}
 
 	for _, version := range httpVersions {
-		res := curlRequest(options.uri, options.proxy.Host, version)
-		printResponse(res, "http-versions")
+		res := curlRequest(options.uri, options.proxy.Host, version, options.redirect)
+		printResponse(res, "http-versions", options)
 	}
 
 }
 
-func curlRequest(url string, proxy string, httpVersion string) Result {
+func curlRequest(url string, proxy string, httpVersion string, redirect bool) Result {
 	args := []string{"-i", "-s", httpVersion}
 	args = append(args, "-H", "User-Agent:")
 	args = append(args, "-H", "Accept:")
@@ -869,6 +1089,7 @@ func requestPathCaseSwitching(options RequestOptions) {
 			statusCode, response, err := request(options.method, fullpath, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
 			if err != nil {
 				log.Println(err)
+				return
 			}
 
 			result := Result{
@@ -878,7 +1099,7 @@ func requestPathCaseSwitching(options RequestOptions) {
 				defaultReq:    false,
 			}
 
-			printResponse(result, "path-case-switching")
+			printResponse(result, "path-case-switching", options)
 		}(path)
 	}
 
@@ -924,7 +1145,7 @@ func joinURL(base string, path string) string {
 }
 
 // setupRequestOptions configures and returns RequestOptions based on the provided parameters.
-func setupRequestOptions(uri, proxy, userAgent string, reqHeaders []string, bypassIP, folder, method string, verbose bool, techniques []string, banner, rateLimit bool, timeout int, redirect, randomAgent bool) RequestOptions {
+func setupRequestOptions(uri, proxy, userAgent string, reqHeaders []string, bypassIP, folder, method string, verbose bool, techniques []string, banner, rateLimit bool, timeout int, redirect, randomAgent bool, jsonBody string) RequestOptions {
 	// Set up proxy if provided.
 	if len(proxy) != 0 {
 		if !strings.Contains(proxy, "http") {
@@ -969,7 +1190,7 @@ func setupRequestOptions(uri, proxy, userAgent string, reqHeaders []string, bypa
 	if len(reqHeaders) > 0 && reqHeaders[0] != "" {
 		for _, _header := range reqHeaders {
 			headerSplit := strings.Split(_header, ":")
-			headers = append(headers, header{headerSplit[0], strings.Join(headerSplit[1:], "")})
+			headers = append(headers, header{headerSplit[0], strings.Join(headerSplit[1:], ":")})
 		}
 	}
 
@@ -989,6 +1210,7 @@ func setupRequestOptions(uri, proxy, userAgent string, reqHeaders []string, bypa
 		reqHeaders:    reqHeaders,
 		banner:        banner,
 		autocalibrate: !verbose,
+		jsonBody:      jsonBody,
 	}
 }
 
@@ -1011,6 +1233,10 @@ func resetMaps() {
 		delete(uniqueResultsByTechnique, k)
 	}
 	uniqueResultsByTechMutex.Unlock()
+
+	verbTamperingResults = make(map[string]int)
+
+	resetSmartFilter()
 }
 
 // executeTechniques runs the selected bypass techniques based on the provided options.
@@ -1066,18 +1292,36 @@ func executeTechniques(options RequestOptions) {
 			requestProtocolBypass(options)
 		case "port":
 			requestPortBypass(options)
+		// New techniques
+		case "auth-headers":
+			requestAuthHeaders(options)
+		case "url-fuzz-3pos":
+			requestURLFuzz3Pos(options)
+		case "api-version":
+			requestAPIVersion(options)
+		case "trailing-dot":
+			requestTrailingDot(options)
+		case "unicode-brute":
+			requestUnicodeBrute(options)
+		case "useragent-fuzz":
+			requestUserAgentFuzz(options)
+		case "json-tamper":
+			requestJSONTamper(options)
 		default:
 			fmt.Printf("Unrecognized technique: %s\n", tech)
-			fmt.Print("Available techniques: verbs, verbs-case, headers, endpaths, midpaths, double-encoding, http-versions, path-case, extensions, default-creds, bugbounty-tips, ipv6, host-header, unicode, waf-bypass, wayback, via-header, forwarded, cache-control, accept-header, protocol, port\n")
+			fmt.Print("Available techniques: verbs, verbs-case, headers, endpaths, midpaths, double-encoding, http-versions, path-case, extensions, default-creds, bugbounty-tips, ipv6, host-header, unicode, waf-bypass, wayback, via-header, forwarded, cache-control, accept-header, protocol, port, auth-headers, url-fuzz-3pos, api-version, trailing-dot, unicode-brute, useragent-fuzz\n")
 		}
 	}
 }
 
 // requester is the main function that runs all the tests.
-func requester(uri string, proxy string, userAgent string, reqHeaders []string, bypassIP string, folder string, method string, verbose bool, techniques []string, banner bool, rateLimit bool, timeout int, redirect bool, randomAgent bool) {
+func requester(uri string, proxy string, userAgent string, reqHeaders []string, bypassIP string, folder string, method string, verbose bool, techniques []string, banner bool, rateLimit bool, timeout int, redirect bool, randomAgent bool, jsonBody string) {
 	_verbose = verbose
 
-	options := setupRequestOptions(uri, proxy, userAgent, reqHeaders, bypassIP, folder, method, verbose, techniques, banner, rateLimit, timeout, redirect, randomAgent)
+	// Reset smart filter
+	resetSmartFilter()
+
+	options := setupRequestOptions(uri, proxy, userAgent, reqHeaders, bypassIP, folder, method, verbose, techniques, banner, rateLimit, timeout, redirect, randomAgent, jsonBody)
 
 	// Reset all tracking data
 	resetMaps()
@@ -1093,9 +1337,11 @@ func requester(uri string, proxy string, userAgent string, reqHeaders []string, 
 	// Display configuration and perform auto-calibration
 	showInfo(options)
 
-	// Auto-calibrate
+	// Auto-calibrate (enhanced: returns both defaultCL and tolerance)
 	if options.autocalibrate {
-		defaultCl = runAutocalibrate(options)
+		defaultCl, calTolerance = runAutocalibrate(options)
+		options.defaultCL = defaultCl
+		options.calTolerance = calTolerance
 	}
 
 	requestDefault(options)
@@ -1150,7 +1396,7 @@ func requestExtensions(options RequestOptions) {
 				contentLength: len(response),
 				defaultReq:    false,
 			}
-			printResponse(result, "extensions")
+			printResponse(result, "extensions", options)
 		}(line)
 	}
 	w.WaitAllDone()
@@ -1196,7 +1442,7 @@ func requestDefaultCreds(options RequestOptions) {
 				contentLength: len(response),
 				defaultReq:    false,
 			}
-			printResponse(result, "default-creds")
+			printResponse(result, "default-creds", options)
 		}(line)
 	}
 	w.WaitAllDone()
@@ -1220,7 +1466,7 @@ func requestBugBountyTips(options RequestOptions) {
 
 	baseURL := parsedURL.Scheme + "://" + parsedURL.Host
 	pathParts := strings.Split(strings.Trim(parsedURL.Path, "/"), "/")
-	
+
 	if len(pathParts) == 0 || (len(pathParts) == 1 && pathParts[0] == "") {
 		log.Println("No path to manipulate for bug bounty techniques")
 		return
@@ -1241,7 +1487,7 @@ func requestBugBountyTips(options RequestOptions) {
 			defer w.Done()
 
 			var modifiedURL string
-			
+
 			// Apply different patterns based on the payload
 			switch line {
 			case "%2e":
@@ -1296,7 +1542,7 @@ func requestBugBountyTips(options RequestOptions) {
 				contentLength: len(response),
 				defaultReq:    false,
 			}
-			printResponse(result, "bugbounty-tips")
+			printResponse(result, "bugbounty-tips", options)
 		}(line)
 	}
 	w.WaitAllDone()
@@ -1348,7 +1594,7 @@ func requestIPv6Bypass(options RequestOptions) {
 					statusCode:    statusCode,
 					contentLength: len(response),
 				}
-				printResponse(result, "ipv6")
+				printResponse(result, "ipv6", options)
 			}(hdr, ipv6)
 		}
 	}
@@ -1411,7 +1657,7 @@ func requestHostHeader(options RequestOptions) {
 				statusCode:    statusCode,
 				contentLength: len(response),
 			}
-			printResponse(result, "host-header")
+			printResponse(result, "host-header", options)
 		}(hostVal)
 	}
 	w.WaitAllDone()
@@ -1455,7 +1701,7 @@ func requestUnicodeBypass(options RequestOptions) {
 				statusCode:    statusCode,
 				contentLength: len(response),
 			}
-			printResponse(result, "unicode")
+			printResponse(result, "unicode", options)
 		}(payload)
 	}
 	w.WaitAllDone()
@@ -1496,7 +1742,7 @@ func requestWAFBypass(options RequestOptions) {
 				statusCode:    statusCode,
 				contentLength: len(response),
 			}
-			printResponse(result, "waf-bypass")
+			printResponse(result, "waf-bypass", options)
 		}(payload)
 	}
 	w.WaitAllDone()
@@ -1519,7 +1765,9 @@ func requestWaybackCheck(options RequestOptions) {
 
 	body, _ := io.ReadAll(resp.Body)
 	var wayback WaybackResponse
-	json.Unmarshal(body, &wayback)
+	if err := json.Unmarshal(body, &wayback); err != nil {
+		return
+	}
 
 	if wayback.ArchivedSnapshots.Closest.Available {
 		fmt.Printf("%s Archived snapshot found!\n", color.GreenString("[+]"))
@@ -1533,7 +1781,7 @@ func requestWaybackCheck(options RequestOptions) {
 			statusCode:    statusCode,
 			contentLength: len(response),
 		}
-		printResponse(result, "wayback")
+		printResponse(result, "wayback", options)
 	} else {
 		fmt.Printf("%s No archived snapshots found\n", color.YellowString("[*]"))
 	}
@@ -1584,7 +1832,7 @@ func requestViaHeader(options RequestOptions) {
 				statusCode:    statusCode,
 				contentLength: len(response),
 			}
-			printResponse(result, "via-header")
+			printResponse(result, "via-header", options)
 		}(via)
 	}
 	w.WaitAllDone()
@@ -1627,7 +1875,7 @@ func requestForwardedHeader(options RequestOptions) {
 				statusCode:    statusCode,
 				contentLength: len(response),
 			}
-			printResponse(result, "forwarded")
+			printResponse(result, "forwarded", options)
 		}(fwd)
 	}
 	w.WaitAllDone()
@@ -1668,7 +1916,7 @@ func requestCacheHeaders(options RequestOptions) {
 				statusCode:    statusCode,
 				contentLength: len(response),
 			}
-			printResponse(result, "cache-control")
+			printResponse(result, "cache-control", options)
 		}(ch)
 	}
 	w.WaitAllDone()
@@ -1709,7 +1957,7 @@ func requestAcceptHeader(options RequestOptions) {
 				statusCode:    statusCode,
 				contentLength: len(response),
 			}
-			printResponse(result, "accept-header")
+			printResponse(result, "accept-header", options)
 		}(accept)
 	}
 	w.WaitAllDone()
@@ -1734,7 +1982,7 @@ func requestProtocolBypass(options RequestOptions) {
 			return
 		}
 		result := Result{line: "HTTP downgrade: " + httpURL, statusCode: statusCode, contentLength: len(response)}
-		printResponse(result, "protocol")
+		printResponse(result, "protocol", options)
 	}()
 
 	// HTTPS upgrade
@@ -1746,7 +1994,7 @@ func requestProtocolBypass(options RequestOptions) {
 			return
 		}
 		result := Result{line: "HTTPS upgrade: " + httpsURL, statusCode: statusCode, contentLength: len(response)}
-		printResponse(result, "protocol")
+		printResponse(result, "protocol", options)
 	}()
 
 	// X-Forwarded-Scheme
@@ -1762,7 +2010,7 @@ func requestProtocolBypass(options RequestOptions) {
 				return
 			}
 			result := Result{line: "X-Forwarded-Scheme: " + scheme, statusCode: statusCode, contentLength: len(response)}
-			printResponse(result, "protocol")
+			printResponse(result, "protocol", options)
 		}(scheme)
 	}
 	w.WaitAllDone()
@@ -1796,7 +2044,7 @@ func requestPortBypass(options RequestOptions) {
 				statusCode:    statusCode,
 				contentLength: len(response),
 			}
-			printResponse(result, "port")
+			printResponse(result, "port", options)
 		}(port)
 	}
 	w.WaitAllDone()
@@ -1809,11 +2057,14 @@ func requestHttpVersionsEnhanced(options RequestOptions) {
 	httpVersions := []string{"--http1.0", "--http1.1", "--http2", "--http2-prior-knowledge"}
 
 	for _, version := range httpVersions {
-		res := curlRequest(options.uri, options.proxy.Host, version)
+		res := curlRequest(options.uri, options.proxy.Host, version, options.redirect)
 		if res.statusCode != 0 {
-			printResponse(res, "http-versions")
+			printResponse(res, "http-versions", options)
 		}
 	}
+
+	// Pure Go HTTP/2 test (no curl dependency)
+	requestHttpVersionsPureGo(options)
 }
 
 // ============================================================================
@@ -1954,4 +2205,446 @@ func resetStatistics() {
 	jsonMutex.Unlock()
 
 	interrupted = false
+}
+
+// ─────────────────────────────────────────────────────────────
+// SMART FILTER (@defparam)
+// ─────────────────────────────────────────────────────────────
+
+func smartFilterKey(statusCode, contentLength int) string {
+	return fmt.Sprintf("%d-%d", statusCode, contentLength)
+}
+
+func checkSmartFilter(statusCode, contentLength int) bool {
+	if !smartFilterEnabled {
+		return true
+	}
+	smartFilterMu.Lock()
+	defer smartFilterMu.Unlock()
+
+	key := smartFilterKey(statusCode, contentLength)
+	entry, exists := smartFilter[key]
+	if !exists {
+		smartFilter[key] = &smartFilterEntry{count: 1}
+		return true
+	}
+	entry.count++
+	if entry.count >= smartFilterThreshold && !entry.muted {
+		entry.muted = true
+		printMutex.Lock()
+		fmt.Printf("\n  \033[33m[~]\033[0m Smart filter: muted response pattern %s (seen %d times)\n", key, entry.count)
+		printMutex.Unlock()
+		return false
+	}
+	if entry.muted {
+		return false
+	}
+	return true
+}
+
+func resetSmartFilter() {
+	smartFilterMu.Lock()
+	defer smartFilterMu.Unlock()
+	smartFilter = make(map[string]*smartFilterEntry)
+}
+
+// ─────────────────────────────────────────────────────────────
+// NEW TECHNIQUE: Auth Headers (from BypassFuzzer)
+// ─────────────────────────────────────────────────────────────
+
+func requestAuthHeaders(options RequestOptions) {
+	lines, err := parseFile(options.folder + "/authheaders")
+	if err != nil {
+		color.Red("[!] Auth headers file not found: %s", options.folder+"/authheaders")
+		return
+	}
+
+	color.Cyan("\n━━━━━━━━━━━━━━━ AUTH HEADER BYPASS ━━━━━━━━━━━━━━━")
+	fmt.Printf("  Testing %d auth bypass headers...\n", len(lines))
+
+	w := goccm.New(maxGoroutines)
+	for _, line := range lines {
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+		w.Wait()
+		go func(hdr string) {
+			defer w.Done()
+			parts := strings.SplitN(hdr, ": ", 2)
+			if len(parts) != 2 {
+				return
+			}
+
+			headers := append([]header{}, options.headers...)
+			headers = append(headers, header{parts[0], parts[1]})
+			statusCode, body, err := request(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			if err != nil {
+				return
+			}
+			contentLength := len(body)
+			if isInterestingResponse(statusCode, contentLength, options) {
+				if checkSmartFilter(statusCode, contentLength) {
+					printResponse(Result{
+						line:          fmt.Sprintf("Auth-Header: %s: %s", parts[0], parts[1]),
+						statusCode:    statusCode,
+						contentLength: contentLength,
+					}, "auth-headers", options)
+				}
+			}
+		}(line)
+	}
+	w.WaitAllDone()
+}
+
+// ─────────────────────────────────────────────────────────────
+// NEW TECHNIQUE: URL Fuzz 3-Position (from BypassFuzzer)
+// ─────────────────────────────────────────────────────────────
+
+func requestURLFuzz3Pos(options RequestOptions) {
+	lines, err := parseFile(options.folder + "/urlfuzz")
+	if err != nil {
+		color.Red("[!] URL fuzz file not found: %s", options.folder+"/urlfuzz")
+		return
+	}
+
+	parsedURL, _ := url.Parse(options.uri)
+	pathSegments := strings.Split(strings.Trim(parsedURL.Path, "/"), "/")
+	if len(pathSegments) == 0 || (len(pathSegments) == 1 && pathSegments[0] == "") {
+		pathSegments = []string{""}
+	}
+	baseURL := strings.TrimSuffix(options.uri, parsedURL.Path)
+
+	totalTests := len(lines) * len(pathSegments) * 3
+	color.Cyan("\n━━━━━━━━━━━━━━━ URL FUZZ 3-POSITION ━━━━━━━━━━━━━━━")
+	fmt.Printf("  Testing %d payloads × %d segments × 3 positions = %d requests...\n",
+		len(lines), len(pathSegments), totalTests)
+
+	w := goccm.New(maxGoroutines)
+	for _, payload := range lines {
+		for segIdx, segment := range pathSegments {
+			// Position 1: PREFIX — {payload}{segment}
+			w.Wait()
+			go func(p, seg string, idx int) {
+				defer w.Done()
+				testSegments := make([]string, len(pathSegments))
+				copy(testSegments, pathSegments)
+				testSegments[idx] = p + seg
+				testPath := strings.Join(testSegments, "/")
+				testURL := baseURL + "/" + testPath
+
+				statusCode, body, err := request(options.method, testURL, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+				if err != nil {
+					return
+				}
+				cl := len(body)
+				if isInterestingResponse(statusCode, cl, options) {
+					if checkSmartFilter(statusCode, cl) {
+						printResponse(Result{
+							line:          fmt.Sprintf("PREFIX seg[%d]: /%s", idx, testPath),
+							statusCode:    statusCode,
+							contentLength: cl,
+						}, "url-fuzz-3pos", options)
+					}
+				}
+			}(payload, segment, segIdx)
+
+			// Position 2: SUFFIX — {segment}{payload}
+			w.Wait()
+			go func(p, seg string, idx int) {
+				defer w.Done()
+				testSegments := make([]string, len(pathSegments))
+				copy(testSegments, pathSegments)
+				testSegments[idx] = seg + p
+				testPath := strings.Join(testSegments, "/")
+				testURL := baseURL + "/" + testPath
+
+				statusCode, body, err := request(options.method, testURL, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+				if err != nil {
+					return
+				}
+				cl := len(body)
+				if isInterestingResponse(statusCode, cl, options) {
+					if checkSmartFilter(statusCode, cl) {
+						printResponse(Result{
+							line:          fmt.Sprintf("SUFFIX seg[%d]: /%s", idx, testPath),
+							statusCode:    statusCode,
+							contentLength: cl,
+						}, "url-fuzz-3pos", options)
+					}
+				}
+			}(payload, segment, segIdx)
+
+			// Position 3: ENCLOSED — {payload}{segment}{payload}
+			w.Wait()
+			go func(p, seg string, idx int) {
+				defer w.Done()
+				testSegments := make([]string, len(pathSegments))
+				copy(testSegments, pathSegments)
+				testSegments[idx] = p + seg + p
+				testPath := strings.Join(testSegments, "/")
+				testURL := baseURL + "/" + testPath
+
+				statusCode, body, err := request(options.method, testURL, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+				if err != nil {
+					return
+				}
+				cl := len(body)
+				if isInterestingResponse(statusCode, cl, options) {
+					if checkSmartFilter(statusCode, cl) {
+						printResponse(Result{
+							line:          fmt.Sprintf("ENCLOSED seg[%d]: /%s", idx, testPath),
+							statusCode:    statusCode,
+							contentLength: cl,
+						}, "url-fuzz-3pos", options)
+					}
+				}
+			}(payload, segment, segIdx)
+		}
+	}
+	w.WaitAllDone()
+}
+
+// ─────────────────────────────────────────────────────────────
+// NEW TECHNIQUE: API Version Substitution (from Forbidden-Buster)
+// ─────────────────────────────────────────────────────────────
+
+func requestAPIVersion(options RequestOptions) {
+	parsedURL, _ := url.Parse(options.uri)
+	path := parsedURL.Path
+
+	versionRegex := regexp.MustCompile(`/v(\d+(?:\.\d+)*)/?`)
+	matches := versionRegex.FindStringSubmatch(path)
+	if matches == nil {
+		fmt.Printf("  \033[33m[~]\033[0m No API version pattern found in path, skipping.\n")
+		return
+	}
+
+	currentVersion := matches[1]
+	allVersions := []string{"1", "2", "3", "4"}
+
+	if strings.Contains(currentVersion, ".") {
+		decimalVersions := []string{"1.0", "2.0", "3.0", "4.0"}
+		allVersions = decimalVersions
+	}
+
+	baseURL := strings.TrimSuffix(options.uri, parsedURL.Path)
+	color.Cyan("\n━━━━━━━━━━━━━━━ API VERSION SUBSTITUTION ━━━━━━━━━━━━━━━")
+	fmt.Printf("  Detected API version v%s, testing alternatives...\n", currentVersion)
+
+	w := goccm.New(maxGoroutines)
+	for _, newVer := range allVersions {
+		if newVer == currentVersion {
+			continue
+		}
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+		w.Wait()
+		go func(ver string) {
+			defer w.Done()
+
+			var newPath string
+			if !strings.Contains(path, "/v"+currentVersion) {
+				newPath = path + "v" + ver + "/"
+			} else {
+				newPath = strings.Replace(path, "/v"+currentVersion+"/", "/v"+ver+"/", 1)
+			}
+
+			testURL := baseURL + newPath
+			if parsedURL.RawQuery != "" {
+				testURL += "?" + parsedURL.RawQuery
+			}
+
+			statusCode, body, err := request(options.method, testURL, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			if err != nil {
+				return
+			}
+			cl := len(body)
+			if isInterestingResponse(statusCode, cl, options) {
+				if checkSmartFilter(statusCode, cl) {
+					printResponse(Result{
+						line:          fmt.Sprintf("API: v%s → v%s", currentVersion, ver),
+						statusCode:    statusCode,
+						contentLength: cl,
+					}, "api-version", options)
+				}
+			}
+		}(newVer)
+	}
+	w.WaitAllDone()
+}
+
+// ─────────────────────────────────────────────────────────────
+// NEW TECHNIQUE: Trailing Dot Attack (from BypassFuzzer)
+// ─────────────────────────────────────────────────────────────
+
+func requestTrailingDot(options RequestOptions) {
+	parsedURL, _ := url.Parse(options.uri)
+	host := parsedURL.Host
+
+	if options.proxy != nil {
+		fmt.Printf("  \033[33m[~]\033[0m Proxy detected, skipping trailing-dot attack.\n")
+		return
+	}
+
+	var trailingHost string
+	if strings.Contains(host, ":") {
+		parts := strings.SplitN(host, ":", 2)
+		trailingHost = parts[0] + ".:" + parts[1]
+	} else {
+		trailingHost = host + "."
+	}
+
+	trailingURL := strings.Replace(options.uri, "://"+host, "://"+trailingHost, 1)
+	headers := append([]header{}, options.headers...)
+	headers = append(headers, header{"Host", trailingHost})
+
+	color.Cyan("\n━━━━━━━━━━━━━━━ TRAILING DOT ATTACK ━━━━━━━━━━━━━━━")
+	fmt.Printf("  Testing trailing-dot: Host: %s\n", trailingHost)
+
+	statusCode, body, err := request(options.method, trailingURL, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+	if err != nil {
+		return
+	}
+	cl := len(body)
+	if isInterestingResponse(statusCode, cl, options) {
+		if checkSmartFilter(statusCode, cl) {
+			printResponse(Result{
+				line:          fmt.Sprintf("Trailing-Dot: %s", trailingHost),
+				statusCode:    statusCode,
+				contentLength: cl,
+			}, "trailing-dot", options)
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// NEW TECHNIQUE: Unicode Bruteforce (from Forbidden-Buster)
+// ─────────────────────────────────────────────────────────────
+
+func requestUnicodeBrute(options RequestOptions) {
+	lines, err := parseFile(options.folder + "/unicode_brute")
+	if err != nil {
+		color.Red("[!] Unicode brute file not found: %s", options.folder+"/unicode_brute")
+		return
+	}
+
+	parsedURL, _ := url.Parse(options.uri)
+	path := parsedURL.Path
+	baseURL := strings.TrimSuffix(options.uri, path)
+
+	totalTests := len(lines) * 3
+	color.Cyan("\n━━━━━━━━━━━━━━━ UNICODE BRUTEFORCE ━━━━━━━━━━━━━━━")
+	fmt.Printf("  Testing %d byte-pairs × 3 positions = %d requests...\n", len(lines), totalTests)
+
+	w := goccm.New(maxGoroutines)
+	for _, fuzz := range lines {
+		// Position 1: /<fuzz><path>
+		w.Wait()
+		go func(f string) {
+			defer w.Done()
+			testURL := baseURL + "/" + f + path
+			statusCode, body, err := request(options.method, testURL, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			if err != nil {
+				return
+			}
+			cl := len(body)
+			if isInterestingResponse(statusCode, cl, options) {
+				if checkSmartFilter(statusCode, cl) {
+					printResponse(Result{
+						line:          fmt.Sprintf("PREFIX: /%s%s", f, path),
+						statusCode:    statusCode,
+						contentLength: cl,
+					}, "unicode-brute", options)
+				}
+			}
+		}(fuzz)
+
+		// Position 2: /<path>/<fuzz>
+		w.Wait()
+		go func(f string) {
+			defer w.Done()
+			testURL := baseURL + path + "/" + f
+			statusCode, body, err := request(options.method, testURL, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			if err != nil {
+				return
+			}
+			cl := len(body)
+			if isInterestingResponse(statusCode, cl, options) {
+				if checkSmartFilter(statusCode, cl) {
+					printResponse(Result{
+						line:          fmt.Sprintf("SUFFIX: %s/%s", path, f),
+						statusCode:    statusCode,
+						contentLength: cl,
+					}, "unicode-brute", options)
+				}
+			}
+		}(fuzz)
+
+		// Position 3: /<path><fuzz>
+		w.Wait()
+		go func(f string) {
+			defer w.Done()
+			testURL := baseURL + path + f
+			statusCode, body, err := request(options.method, testURL, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			if err != nil {
+				return
+			}
+			cl := len(body)
+			if isInterestingResponse(statusCode, cl, options) {
+				if checkSmartFilter(statusCode, cl) {
+					printResponse(Result{
+						line:          fmt.Sprintf("APPEND: %s%s", path, f),
+						statusCode:    statusCode,
+						contentLength: cl,
+					}, "unicode-brute", options)
+				}
+			}
+		}(fuzz)
+	}
+	w.WaitAllDone()
+}
+
+// ─────────────────────────────────────────────────────────────
+// NEW TECHNIQUE: User-Agent Fuzzing (from Forbidden-Buster)
+// ─────────────────────────────────────────────────────────────
+
+func requestUserAgentFuzz(options RequestOptions) {
+	lines, err := parseFile(options.folder + "/useragents_full")
+	if err != nil {
+		color.Red("[!] User-Agent file not found: %s", options.folder+"/useragents_full")
+		return
+	}
+
+	color.Cyan("\n━━━━━━━━━━━━━━━ USER-AGENT FUZZING ━━━━━━━━━━━━━━━")
+	fmt.Printf("  Testing %d User-Agent strings...\n", len(lines))
+
+	w := goccm.New(maxGoroutines)
+	for _, ua := range lines {
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+		w.Wait()
+		go func(agent string) {
+			defer w.Done()
+			headers := append([]header{}, options.headers...)
+			for i, h := range headers {
+				if h.key == "User-Agent" {
+					headers[i].value = agent
+					goto found
+				}
+			}
+			headers = append(headers, header{"User-Agent", agent})
+		found:
+			statusCode, body, err := request(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			if err != nil {
+				return
+			}
+			cl := len(body)
+			if isInterestingResponse(statusCode, cl, options) {
+				if checkSmartFilter(statusCode, cl) {
+					printResponse(Result{
+						line:          fmt.Sprintf("UA: %s", agent),
+						statusCode:    statusCode,
+						contentLength: cl,
+					}, "useragent-fuzz", options)
+				}
+			}
+		}(ua)
+	}
+	w.WaitAllDone()
 }

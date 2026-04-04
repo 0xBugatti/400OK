@@ -1,0 +1,24 @@
+Authorization: Basic A
+Authorization: Bearer
+Authorization: Bearer A
+Authorization: Token A
+Php-Auth-User: admin
+Sessionid: A
+X-CSRFToken: DECAFC0FFEEBAD
+X-Csrf-Token: DECAFC0FFEEBAD
+X-XSRF-TOKEN: DECAFC0FFEEBAD
+X-UIDH: 31337DEADBEEFCAFE
+Proxy-Connection: keep-alive
+Max-Forwards: 0
+Max-Forwards: 1
+Max-Forwards: 2
+X-Requested-With: XMLHttpRequest
+X-Do-Not-Track: 1
+X-Att-Deviceid: GT-P7320/P7320XXLPG
+X-Correlation-ID: f058ebd6-02f7-4d3f-942e-904344e8cde5
+X-Request-ID: 1234567890
+X-Request-ID: f058ebd6-02f7-4d3f-942e-904344e8cde5
+Request-ID: 1234567890
+Siteid: 0
+Siteid: 1
+X-Wap-Profile: http://wap.samsungmobile.com/uaprof/SGH-I777.xml
